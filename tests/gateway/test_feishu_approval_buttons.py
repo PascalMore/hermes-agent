@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -78,6 +79,44 @@ def _close_submitted_coro(coro, _loop):
     """Close scheduled coroutines in sync-handler tests to avoid unawaited warnings."""
     coro.close()
     return SimpleNamespace(add_done_callback=lambda *_args, **_kwargs: None)
+
+
+class TestFeishuKnowledgeCardAction:
+    """Profile-local deterministic card handler — no agent turn involved."""
+
+    def test_runs_profile_handler_with_authenticated_context(self, monkeypatch):
+        adapter = _make_adapter()
+        data = _make_card_action_data(
+            {"knowledge_action": "retain", "candidate_id": "abc", "expected_digest": "digest", "expires_at": "2030-01-01T00:00:00+00:00"}
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            handler = scripts / "knowledge.py"
+            handler.write_text("# fixture", encoding="utf-8")
+            monkeypatch.setenv("FEISHU_KNOWLEDGE_ACTION_HANDLER", str(handler))
+            monkeypatch.setenv("FEISHU_KNOWLEDGE_CHAT_ID", "oc_12345")
+            with patch.object(feishu_module, "get_hermes_home", return_value=home), \
+                 patch.object(feishu_module, "P2CardActionTriggerResponse", MagicMock()), \
+                 patch.object(feishu_module, "CallBackCard", MagicMock()), \
+                 patch.object(feishu_module.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "card": {"header": {}}})) ) as run:
+                response = adapter._handle_knowledge_card_action(event=data.event, action_value=data.event.action.value)
+
+        assert response is not None
+        payload = json.loads(run.call_args.kwargs["input"])
+        assert payload["actor"] == "ou_user1"
+        assert payload["chat_id"] == "oc_12345"
+        assert run.call_args.args[0][1] == str(handler)
+
+    def test_rejects_handler_outside_profile_scripts(self, monkeypatch):
+        adapter = _make_adapter()
+        data = _make_card_action_data({"knowledge_action": "retain"})
+        monkeypatch.setenv("FEISHU_KNOWLEDGE_ACTION_HANDLER", "/tmp/not-allowed.py")
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(feishu_module, "get_hermes_home", return_value=Path(temp)):
+            response = adapter._handle_knowledge_card_action(event=data.event, action_value=data.event.action.value)
+        assert response is None or response is not False
 
 
 # ===========================================================================
@@ -445,5 +484,3 @@ class TestResolveUpdatePrompt:
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
-
-

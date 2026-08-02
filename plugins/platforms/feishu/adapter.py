@@ -58,6 +58,8 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -2695,6 +2697,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 action_value=action_value,
                 loop=loop,
             )
+        if isinstance(action_value, dict) and action_value.get("knowledge_action"):
+            return self._handle_knowledge_card_action(event=event, action_value=action_value)
 
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
@@ -2841,6 +2845,76 @@ class FeishuAdapter(BasePlatformAdapter):
             card.type = "raw"
             card.data = self._build_resolved_update_prompt_card(answer=answer, user_name=user_name)
             response.card = card
+        return response
+
+    def _handle_knowledge_card_action(self, *, event: Any, action_value: Dict[str, Any]) -> Any:
+        """Run an explicitly configured, profile-local knowledge card handler.
+
+        This is deliberately generic: the Feishu adapter neither knows JMap
+        paths nor interprets knowledge actions.  A profile opts in with
+        ``FEISHU_KNOWLEDGE_ACTION_HANDLER`` pointing to an executable inside
+        its own ``scripts/`` directory.  The subprocess receives only the
+        button value plus authenticated actor/chat identifiers, and returns a
+        raw callback card.  No LLM turn is involved.
+        """
+        handler_raw = os.getenv("FEISHU_KNOWLEDGE_ACTION_HANDLER", "").strip()
+        if not handler_raw:
+            logger.warning("[Feishu] knowledge card action received but no handler is configured")
+            return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅：未配置", "知识审阅处理器尚未配置。", "red")})
+
+        handler = Path(handler_raw).expanduser().resolve()
+        allowed_root = (get_hermes_home() / "scripts").resolve()
+        try:
+            handler.relative_to(allowed_root)
+        except ValueError:
+            logger.warning("[Feishu] refusing knowledge handler outside profile scripts: %s", handler)
+            return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅：未执行", "知识审阅处理器路径无效。", "red")})
+        if not handler.is_file():
+            return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅：未执行", "知识审阅处理器不存在。", "red")})
+
+        context = getattr(event, "context", None)
+        chat_id = str(getattr(context, "open_chat_id", "") or "")
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        required_chat = os.getenv("FEISHU_KNOWLEDGE_CHAT_ID", "").strip()
+        if not self._is_interactive_operator_authorized(open_id) or (required_chat and required_chat != chat_id):
+            logger.warning("[Feishu] unauthorized knowledge card action by %s in %s", open_id or "<unknown>", chat_id or "<unknown>")
+            return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅：未执行", "该审阅操作没有权限。", "red")})
+
+        token = str(getattr(event, "token", "") or "")
+        if token and self._is_card_action_duplicate(token):
+            return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅", "该操作已处理或正在处理。", "orange")})
+
+        payload = dict(action_value)
+        payload.update({"actor": open_id, "chat_id": chat_id})
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(handler)], input=json.dumps(payload, ensure_ascii=False),
+                text=True, capture_output=True, timeout=8, check=False,
+            )
+            result = json.loads(completed.stdout or "{}")
+            if completed.returncode != 0 or not isinstance(result, dict):
+                raise ValueError("处理器未返回有效结果")
+        except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("[Feishu] knowledge card handler failed: %s", exc)
+            result = {"ok": False, "card": self._simple_callback_card("JMap 知识审阅：未执行", "审阅处理失败，请刷新卡片后重试。", "red")}
+        return self._knowledge_callback_response(result)
+
+    @staticmethod
+    def _simple_callback_card(title: str, message: str, template: str) -> Dict[str, Any]:
+        return {"config": {"wide_screen_mode": True}, "header": {"title": {"tag": "plain_text", "content": title}, "template": template}, "elements": [{"tag": "markdown", "content": message}]}
+
+    @staticmethod
+    def _knowledge_callback_response(result: Dict[str, Any]) -> Any:
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        card = result.get("card") if isinstance(result, dict) else None
+        if CallBackCard is not None and isinstance(card, dict):
+            callback_card = CallBackCard()
+            callback_card.type = "raw"
+            callback_card.data = card
+            response.card = callback_card
         return response
 
     async def _resolve_approval(
