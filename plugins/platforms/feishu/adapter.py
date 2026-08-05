@@ -1912,20 +1912,20 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        # When chunking splits a long markdown response, an individual chunk
-        # can end up as plain prose that doesn't match the per-chunk hint
-        # regex — so it would be sent as ``msg_type=text`` and the user would
-        # see literal ``**bold``/``## heading``/code fences in the Feishu
-        # client while other chunks render correctly. Lock the markdown
-        # decision at the whole-message level so every chunk consistently
-        # uses ``post``. See #26841.
-        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
+        # Lock the whole-message rendering decision before chunking. A table
+        # split across chunks must remain an interactive card in every chunk;
+        # otherwise ``prefer_post`` would force the table back through the post
+        # renderer and plain continuation chunks could fall back to text.
+        prefer_interactive = bool(_MARKDOWN_TABLE_RE.search(formatted))
+        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted)) and not prefer_interactive
         last_response = None
 
         try:
             for chunk in chunks:
                 msg_type, payload = self._build_outbound_payload(
-                    chunk, prefer_post=prefer_post,
+                    chunk,
+                    prefer_post=prefer_post,
+                    prefer_interactive=prefer_interactive,
                 )
                 try:
                     response = await self._feishu_send_with_retry(
@@ -4664,19 +4664,32 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(
-        self, content: str, *, prefer_post: bool = False,
+        self,
+        content: str,
+        *,
+        prefer_post: bool = False,
+        prefer_interactive: bool = False,
     ) -> tuple[str, str]:
-        # Empirically (issue #52786), current Feishu clients render markdown
-        # tables inside ``post``-type ``md`` elements natively. The previous
-        # table-downgrade branch forced any table-containing message to
-        # ``text``, which left Feishu readers seeing the raw pipe-and-dash
-        # source instead of a rendered table. Trust the common markdown path
-        # for table content too.
-        #
+        # Feishu's mobile post renderer does not keep GFM pipe tables readable.
+        # Use a schema 2.0 interactive card only for standard header+separator
+        # tables. ``prefer_interactive`` keeps every chunk of one table-bearing
+        # message on this path after ``send`` has split it.
+        if prefer_interactive or _MARKDOWN_TABLE_RE.search(content):
+            card = {
+                "schema": "2.0",
+                "config": {"width_mode": "fill"},
+                "body": {
+                    "elements": [
+                        {"tag": "markdown", "content": content},
+                    ],
+                },
+            }
+            return "interactive", json.dumps(card, ensure_ascii=False)
+
         # ``prefer_post`` lets ``send`` treat the chunk as part of a larger
-        # markdown document: when a long markdown reply is split at
-        # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
-        # mis-classify a plain-prose chunk as ``text``. See #26841.
+        # non-table markdown document: when a long reply is split at
+        # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise mis-classify
+        # a plain-prose chunk as ``text``. See #26841.
         if prefer_post or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
