@@ -111,6 +111,7 @@ FEISHU_DOMAIN = None  # type: ignore[assignment]
 LARK_DOMAIN = None  # type: ignore[assignment]
 BaseRequest = None  # type: ignore[assignment]
 CallBackCard = None  # type: ignore[assignment]
+CallBackToast = None  # type: ignore[assignment]
 P2CardActionTriggerResponse = None  # type: ignore[assignment]
 EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
@@ -1411,7 +1412,7 @@ def _load_lark_oapi() -> bool:
             from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
             from lark_oapi.core.model import BaseRequest
             from lark_oapi.event.callback.model.p2_card_action_trigger import (
-                CallBackCard, P2CardActionTriggerResponse,
+                CallBackCard, CallBackToast, P2CardActionTriggerResponse,
             )
             from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
             from lark_oapi.ws import Client as FeishuWSClient
@@ -1441,6 +1442,7 @@ def _load_lark_oapi() -> bool:
             "LARK_DOMAIN": LARK_DOMAIN,
             "BaseRequest": BaseRequest,
             "CallBackCard": CallBackCard,
+            "CallBackToast": CallBackToast,
             "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
@@ -2723,7 +2725,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
         For other card actions: delegates to ``_handle_card_action_event``.
         """
+        # Pascal 2026-09-15 diagnostic: log every card action callback
+        # unconditionally so we can prove whether the WS dispatcher
+        # actually delivers card.action.trigger events.
+        try:
+            logger.warning("[DIAG] _on_card_action_trigger ENTERED; data type=%s", type(data).__name__)
+        except Exception:
+            pass
         loop = self._loop
+        try:
+            logger.warning("[DIAG] loop=%s accepts_callbacks=%s", loop, self._loop_accepts_callbacks(loop) if loop else "no-loop")
+        except Exception as e:
+            logger.warning("[DIAG] loop check failed: %s", e)
         if not self._loop_accepts_callbacks(loop):
             logger.warning("[Feishu] Dropping card action before adapter loop is ready")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
@@ -2731,23 +2744,42 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        try:
+            logger.warning("[DIAG] action_value=%s", dict(action_value) if isinstance(action_value, dict) else action_value)
+        except Exception as e:
+            logger.warning("[DIAG] action_value dump failed: %s", e)
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
         )
+        try:
+            logger.warning("[DIAG] hermes_action=%r update_prompt=%r knowledge_action=%r",
+                hermes_action, update_prompt_action,
+                action_value.get("knowledge_action") if isinstance(action_value, dict) else None)
+        except Exception:
+            pass
 
         if hermes_action:
+            try: logger.warning("[DIAG] routing to _handle_approval_card_action")
+            except Exception: pass
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
+            try: logger.warning("[DIAG] routing to _handle_update_prompt_card_action")
+            except Exception: pass
             return self._handle_update_prompt_card_action(
                 event=event,
                 action_value=action_value,
                 loop=loop,
             )
         if isinstance(action_value, dict) and action_value.get("knowledge_action"):
+            try: logger.warning("[DIAG] routing to _handle_knowledge_card_action (knowledge_action=%r)",
+                action_value.get("knowledge_action"))
+            except Exception: pass
             return self._handle_knowledge_card_action(event=event, action_value=action_value)
 
+        try: logger.warning("[DIAG] routing to _handle_card_action_event (synthetic command)")
+        except Exception: pass
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
             return None
@@ -2922,6 +2954,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         context = getattr(event, "context", None)
         chat_id = str(getattr(context, "open_chat_id", "") or "")
+        # Preserve the actual clicked-message identity for profile handlers.
+        message_id = str(getattr(context, "open_message_id", "") or "")
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         required_chat = os.getenv("FEISHU_KNOWLEDGE_CHAT_ID", "").strip()
@@ -2934,7 +2968,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._knowledge_callback_response({"ok": False, "card": self._simple_callback_card("JMap 知识审阅", "该操作已处理或正在处理。", "orange")})
 
         payload = dict(action_value)
-        payload.update({"actor": open_id, "chat_id": chat_id})
+        payload.update({"actor": open_id, "chat_id": chat_id, "message_id": message_id})
         try:
             completed = subprocess.run(
                 [sys.executable, str(handler)], input=json.dumps(payload, ensure_ascii=False),
@@ -2963,6 +2997,22 @@ class FeishuAdapter(BasePlatformAdapter):
             callback_card.type = "raw"
             callback_card.data = card
             response.card = callback_card
+        # Pascal 2026-09-15: forward an optional toast alongside/without
+        # the callback card.  The SDK's P2CardActionTriggerResponse owns a
+        # ``toast`` slot (CallBackToast: type/content/i18n); the wrapper's
+        # reject path uses ``{"ok": true, "toast": "..."}`` with no card so
+        # the original review card stays untouched in the chat.
+        toast_data = result.get("toast") if isinstance(result, dict) else None
+        if CallBackToast is not None and isinstance(toast_data, dict):
+            toast = CallBackToast()
+            toast.type = str(toast_data.get("type") or "success")
+            toast.content = str(toast_data.get("content") or "")
+            response.toast = toast
+        elif CallBackToast is not None and isinstance(toast_data, str) and toast_data:
+            toast = CallBackToast()
+            toast.type = "success"
+            toast.content = toast_data
+            response.toast = toast
         return response
 
     async def _resolve_approval(
