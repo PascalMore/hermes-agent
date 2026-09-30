@@ -2,6 +2,7 @@ import { type MutableRefObject, useEffect, useRef } from 'react'
 
 import { isNewChatRoute } from '@/app/routes'
 import { type SessionResumeRequest, setResumeExhaustedSessionId } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { markSelectionRestore } from '@/store/session-states'
 
 interface RouteResumeOptions {
@@ -12,7 +13,7 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
-  resumeSession: (sessionId: string, focus: boolean) => Promise<unknown>
+  resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
   // routedSessionId the window would otherwise latch on the loader forever, so
@@ -29,7 +30,7 @@ interface RouteResumeOptions {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  startFreshSessionDraft: (focus: boolean) => unknown
+  startFreshSessionDraft: (options: boolean | { replaceRoute?: boolean; rotateFreshDraftKey?: boolean }) => unknown
 }
 
 // Bounded auto-retry for a stranded session window. A resume can fail terminally
@@ -61,7 +62,7 @@ function rawHashLooksLikeSession(): boolean {
 
   return (
     !hash.startsWith('/settings') &&
-    !hash.startsWith('/skills') &&
+    !hash.startsWith('/capabilities') &&
     !hash.startsWith('/messaging') &&
     !hash.startsWith('/artifacts')
   )
@@ -155,7 +156,8 @@ export function useRouteResume({
       // we're stranded on a routed session that never loaded. The first two
       // guard against a transient /:sid re-resume during "new chat" state clears
       // before the pathname updates from /:sid -> /.
-      const shouldResume = pathnameChanged || gatewayBecameOpen || stuckOnRoutedSession || explicitlyRequested
+      const shouldResume =
+        pathnameChanged || (gatewayBecameOpen && !freshDraftReady) || stuckOnRoutedSession || explicitlyRequested
 
       // On a reconnect (gatewayBecameOpen) re-resume even when the route looks
       // `alreadyActive`: the cached runtime id can be stale once the gateway
@@ -177,9 +179,26 @@ export function useRouteResume({
         }
 
         bootResumeRef.current = false
-        void resumeSession(routedSessionId, true)
+
+        const ownerRoute =
+          sessionResumeRequest?.sessionId === routedSessionId ? sessionResumeRequest.ownerRoute : undefined
+
+        if (ownerRoute) {
+          void resumeSession(routedSessionId, true, ownerRoute)
+        } else {
+          void resumeSession(routedSessionId, true)
+        }
       }
 
+      return
+    }
+
+    // A sleep/wake WS reconnect can reopen on a new-chat route while the active
+    // runtime session is still the user's current chat. The gateway re-opened;
+    // nothing navigated. Forcing a fresh draft here is what turned every
+    // Windows/macOS sleep/wake cycle into a brand-new session and parked the
+    // previous chat in the sidebar (#53374). Preserve the active chat instead.
+    if (isNewChatRoute(locationPathname) && gatewayBecameOpen && activeSessionId && !freshDraftReady) {
       return
     }
 
@@ -191,7 +210,7 @@ export function useRouteResume({
     ) {
       // A fresh draft is a real navigation — any later resume homes normally.
       bootResumeRef.current = false
-      startFreshSessionDraft(true)
+      startFreshSessionDraft({ replaceRoute: true, rotateFreshDraftKey: false })
     }
   }, [
     activeSessionId,
